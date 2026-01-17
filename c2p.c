@@ -1,5 +1,5 @@
 /*
- * Phonex-C2: Research-Grade Pure C Transformer Engine (Final)
+ * Phonex-C2: Research-Grade Pure C Transformer Engine
  * -----------------------------------------------------------
  * Compile: 
  * gcc -O3 -mavx2 -mfma -fopenmp c2p.c -lm -o c2
