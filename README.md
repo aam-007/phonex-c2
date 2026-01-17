@@ -225,7 +225,7 @@ Edit the macros in `c2p.c` to customize the model:
 
 ## Performance
 
-**On a Modern CPU** (Intel i7-10700K, AVX2 + OpenMP):
+**On a Modern CPU** (AMD Ryzen 9 8945HS (16) @ 5.26 GHz, AVX2 + OpenMP):
 
 | Operation | Time (ms) | Throughput |
 |-----------|-----------|------------|
