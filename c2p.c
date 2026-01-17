@@ -31,6 +31,7 @@
 #define D_FF (D_MODEL * 4) // FFN expansion
 #define VOCAB_SIZE 256    // Byte-level
 #define MAX_LAYERS 4      // Depth
+#define TOKEN_EOS 0       // End of sequence token (0 = null byte)
 
 // Optimization Defaults
 #define BLOCK_SIZE 32
@@ -41,6 +42,10 @@
 #define ADAM_B1 0.9f
 #define ADAM_B2 0.99f
 #define ADAM_EPS 1e-8f
+
+// Dataset Configuration
+#define MAX_PHRASES 1000
+#define MAX_PHRASE_LEN 100
 
 // --- 1. Memory & Tensor System ---
 
@@ -575,88 +580,318 @@ void backward_pass(GPT* m, GPTActivations* c, int* inputs) {
     }
 }
 
-// --- Main ---
+// --- Inference & Sampling ---
 
-int main() {
-    printf("[Phonex-C2 Final] Initializing...\n");
-    GPT* model = gpt_init();
-    GPTActivations acts = gpt_activations();
-    
-    // 9. Training Example: "Long Live The Motherland"
-    const char* text = "Long Live The Motherland";
-    int* inputs = malloc(BATCH_SIZE * SEQ_LEN * sizeof(int));
-    int* targets = malloc(BATCH_SIZE * SEQ_LEN * sizeof(int));
-    
-    // Tokenize
-    memset(inputs, 0, BATCH_SIZE*SEQ_LEN*sizeof(int));
-    memset(targets, 0, BATCH_SIZE*SEQ_LEN*sizeof(int));
-    
-    for(int b=0; b<BATCH_SIZE; b++) {
-        int len = strlen(text);
-        for(int i=0; i<len && i<SEQ_LEN; i++) {
-            inputs[b*SEQ_LEN + i] = (unsigned char)text[i];
-            if (i < len-1) targets[b*SEQ_LEN + i] = (unsigned char)text[i+1];
-            else targets[b*SEQ_LEN + i] = TOKEN_EOS;
+int sample_argmax(float* logits, int vocab_size) {
+    int best_idx = 0;
+    float best_val = -1e9f;
+    for (int i = 0; i < vocab_size; i++) {
+        if (logits[i] > best_val) {
+            best_val = logits[i];
+            best_idx = i;
         }
     }
+    return best_idx;
+}
+
+// Temperature sampling (Optional: adds creativity)
+int sample_temp(float* logits, int vocab_size, float temp) {
+    float probs[vocab_size];
+    float sum = 0.0f;
+    float max_l = -1e9f;
     
-    printf("Training on: '%s' (Batch %d)\n", text, BATCH_SIZE);
+    // Stable Softmax with Temp
+    for (int i=0; i<vocab_size; i++) if (logits[i] > max_l) max_l = logits[i];
+    for (int i=0; i<vocab_size; i++) {
+        probs[i] = expf((logits[i] - max_l) / temp);
+        sum += probs[i];
+    }
     
-    // Training Loop
-    for(int step=0; step<MAX_STEPS; step++) {
-        // 1. Zero Gradients & Activations
-        arena_reset(&acts.arena);
-        for(int i=0; i<model->n_params; i++) 
-            memset(model->params[i]->grad, 0, model->params[i]->size * sizeof(float));
-            
-        // 2. Forward
-        forward_pass(model, &acts, inputs);
+    // Random choice based on prob distribution
+    float r = (float)rand() / (float)RAND_MAX;
+    float cdf = 0.0f;
+    for (int i=0; i<vocab_size; i++) {
+        cdf += probs[i] / sum;
+        if (r < cdf) return i;
+    }
+    return vocab_size - 1;
+}
+
+// --- Dataset Loading ---
+
+// Default fallback phrases if dataset.txt is not found
+const char* default_phrases[] = {
+    "Long Live The Motherland",
+    "Knowledge is power",
+    "Time waits for none",
+    "Fortune favors the brave",
+    "Unity is strength",
+    "Seize the day",
+    "Dreams come true",
+    "Action conquers fear",
+    "Silence is golden",
+    "Hard work pays off"
+};
+
+#define NUM_DEFAULT_PHRASES (sizeof(default_phrases)/sizeof(default_phrases[0]))
+
+// Load dataset from file or use defaults
+char** load_dataset(const char* filename, int* num_phrases) {
+    FILE* file = fopen(filename, "r");
+    char** phrases = NULL;
+    *num_phrases = 0;
+    
+    if (file) {
+        printf("[IO] Loading dataset from '%s'\n", filename);
         
-        // 3. Loss & Logits Grad
-        float total_loss = 0;
-        for(int b=0; b<BATCH_SIZE; b++) {
-            for(int t=0; t<SEQ_LEN; t++) {
-                // Ignore padding loss
-                if (inputs[b*SEQ_LEN + t] == 0) continue; 
+        // Count lines
+        char buffer[MAX_PHRASE_LEN];
+        int count = 0;
+        while (fgets(buffer, sizeof(buffer), file) && count < MAX_PHRASES) {
+            count++;
+        }
+        rewind(file);
+        
+        // Allocate memory
+        phrases = (char**)malloc(count * sizeof(char*));
+        if (!phrases) {
+            fprintf(stderr, "Memory allocation failed\n");
+            fclose(file);
+            return NULL;
+        }
+        
+        // Read phrases
+        for (int i = 0; i < count; i++) {
+            if (fgets(buffer, sizeof(buffer), file)) {
+                // Remove newline
+                buffer[strcspn(buffer, "\n")] = 0;
+                buffer[strcspn(buffer, "\r")] = 0;
                 
-                float* logits = acts.logits.data + b*SEQ_LEN*VOCAB_SIZE + t*VOCAB_SIZE;
-                int target = targets[b*SEQ_LEN + t];
-                
-                float max_l = -1e9f;
-                for(int i=0; i<VOCAB_SIZE; i++) if(logits[i] > max_l) max_l = logits[i];
-                float sum = 0;
-                for(int i=0; i<VOCAB_SIZE; i++) sum += expf(logits[i] - max_l);
-                float log_sum = max_l + logf(sum);
-                
-                total_loss += (log_sum - logits[target]);
-                
-                for(int i=0; i<VOCAB_SIZE; i++) {
-                    float p = expf(logits[i] - log_sum);
-                    acts.logits.grad[b*SEQ_LEN*VOCAB_SIZE + t*VOCAB_SIZE + i] = (p - (i==target ? 1.0f : 0.0f)) / BATCH_SIZE;
+                // Skip empty lines
+                if (strlen(buffer) == 0) {
+                    i--; // Try again
+                    continue;
                 }
+                
+                phrases[i] = strdup(buffer);
+                if (!phrases[i]) {
+                    fprintf(stderr, "Memory allocation failed for phrase %d\n", i);
+                    // Free previously allocated
+                    for (int j = 0; j < i; j++) free(phrases[j]);
+                    free(phrases);
+                    fclose(file);
+                    return NULL;
+                }
+                (*num_phrases)++;
             }
         }
         
-        // 4. Backward
-        backward_pass(model, &acts, inputs);
-        
-        // 5. Update
-        clip_gradients(model->params, model->n_params);
-        
-        // LR Schedule
-        float lr = BASE_LR;
-        if (step < WARMUP_STEPS) lr = BASE_LR * (float)step / WARMUP_STEPS;
-        else lr = BASE_LR * 0.5f * (1.0f + cosf(3.14159f * (step - WARMUP_STEPS) / (MAX_STEPS - WARMUP_STEPS)));
-        
-        for(int i=0; i<model->n_params; i++) adamw_step(model->params[i], lr, 0.01f, step);
-        
-        if (step % 10 == 0) {
-            printf("Step %d | Loss: %.4f | LR: %.6f\n", step, total_loss / (BATCH_SIZE * strlen(text)), lr);
+        fclose(file);
+        printf("[IO] Loaded %d phrases from dataset\n", *num_phrases);
+    } else {
+        // Use default phrases
+        printf("[IO] Dataset file '%s' not found. Using default phrases.\n", filename);
+        *num_phrases = NUM_DEFAULT_PHRASES;
+        phrases = (char**)malloc(*num_phrases * sizeof(char*));
+        if (!phrases) {
+            fprintf(stderr, "Memory allocation failed\n");
+            return NULL;
         }
+        
+        for (int i = 0; i < *num_phrases; i++) {
+            phrases[i] = strdup(default_phrases[i]);
+        }
+        
+        printf("[IO] Using %d default phrases\n", *num_phrases);
     }
     
-    save_checkpoint("model_final.bin", model->params, model->n_params);
-    printf("Model saved to model_final.bin\n");
+    return phrases;
+}
+
+// Free dataset memory
+void free_dataset(char** phrases, int num_phrases) {
+    for (int i = 0; i < num_phrases; i++) {
+        free(phrases[i]);
+    }
+    free(phrases);
+}
+
+// Encode random phrase from dataset
+void encode_random_phrase(int* inputs, int* targets, char** phrases, int num_phrases) {
+    // Pick random phrase
+    int idx = rand() % num_phrases;
+    const char* phrase = phrases[idx];
+    int len = strlen(phrase);
+    
+    // Encode phrase with padding/truncation
+    for (int i = 0; i < SEQ_LEN; i++) {
+        if (i < len) {
+            inputs[i] = (unsigned char)phrase[i];
+            // For next token prediction
+            if (i < len - 1) {
+                targets[i] = (unsigned char)phrase[i + 1];
+            } else {
+                targets[i] = TOKEN_EOS;  // End of sequence
+            }
+        } else {
+            // Padding
+            inputs[i] = 0;
+            targets[i] = 0;
+        }
+    }
+}
+
+// --- Main ---
+
+int main(int argc, char* argv[]) {
+    srand(time(NULL));
+    
+    // 1. Initialize Engine
+    printf("[Phonex-C2] Booting...\n");
+    GPT* model = gpt_init();
+    GPTActivations acts = gpt_activations();
+
+    // 2. Mode Selection
+    if (argc < 2) {
+        printf("Usage:\n  ./c2 train          -> Train and save 'model_final.bin'\n  ./c2 gen \"Prompt\"   -> Load 'model_final.bin' and generate text\n");
+        return 1;
+    }
+
+    if (strcmp(argv[1], "train") == 0) {
+        // --- TRAINING MODE ---
+        printf("Training Mode Selected.\n");
+        
+        // Load dataset
+        int num_phrases = 0;
+        char** phrases = load_dataset("dataset.txt", &num_phrases);
+        if (!phrases || num_phrases == 0) {
+            fprintf(stderr, "No training data available.\n");
+            return 1;
+        }
+        
+        printf("Training with %d phrases...\n", num_phrases);
+        
+        // Allocate buffers
+        int* inputs = malloc(BATCH_SIZE * SEQ_LEN * sizeof(int));
+        int* targets = malloc(BATCH_SIZE * SEQ_LEN * sizeof(int));
+        
+        // Training Loop
+        for(int step=0; step<MAX_STEPS; step++) {
+            // 1. Zero Gradients & Activations
+            arena_reset(&acts.arena);
+            for(int i=0; i<model->n_params; i++) 
+                memset(model->params[i]->grad, 0, model->params[i]->size * sizeof(float));
+                
+            // 2. Encode random phrase
+            encode_random_phrase(inputs, targets, phrases, num_phrases);
+            
+            // 3. Forward
+            forward_pass(model, &acts, inputs);
+            
+            // 4. Loss & Logits Grad
+            float total_loss = 0;
+            int total_tokens = 0;
+            
+            for(int b=0; b<BATCH_SIZE; b++) {
+                for(int t=0; t<SEQ_LEN; t++) {
+                    // Ignore padding (positions where input is 0)
+                    if (inputs[b*SEQ_LEN + t] == 0) continue; 
+                    
+                    float* logits = acts.logits.data + b*SEQ_LEN*VOCAB_SIZE + t*VOCAB_SIZE;
+                    int target = targets[b*SEQ_LEN + t];
+                    
+                    float max_l = -1e9f;
+                    for(int i=0; i<VOCAB_SIZE; i++) if(logits[i] > max_l) max_l = logits[i];
+                    float sum = 0;
+                    for(int i=0; i<VOCAB_SIZE; i++) sum += expf(logits[i] - max_l);
+                    float log_sum = max_l + logf(sum);
+                    
+                    total_loss += (log_sum - logits[target]);
+                    total_tokens++;
+                    
+                    for(int i=0; i<VOCAB_SIZE; i++) {
+                        float p = expf(logits[i] - log_sum);
+                        acts.logits.grad[b*SEQ_LEN*VOCAB_SIZE + t*VOCAB_SIZE + i] = (p - (i==target ? 1.0f : 0.0f)) / BATCH_SIZE;
+                    }
+                }
+            }
+            
+            // 5. Backward
+            backward_pass(model, &acts, inputs);
+            
+            // 6. Update
+            clip_gradients(model->params, model->n_params);
+            
+            // LR Schedule
+            float lr = BASE_LR;
+            if (step < WARMUP_STEPS) lr = BASE_LR * (float)step / WARMUP_STEPS;
+            else lr = BASE_LR * 0.5f * (1.0f + cosf(3.14159f * (step - WARMUP_STEPS) / (MAX_STEPS - WARMUP_STEPS)));
+            
+            for(int i=0; i<model->n_params; i++) adamw_step(model->params[i], lr, 0.01f, step);
+            
+            if (step % 10 == 0) {
+                printf("Step %d | Loss: %.4f | LR: %.6f\n", step, total_loss / total_tokens, lr);
+            }
+        }
+        
+        save_checkpoint("model_final.bin", model->params, model->n_params);
+        printf("[IO] Model saved to model_final.bin\n");
+        
+        // Cleanup
+        free(inputs);
+        free(targets);
+        free_dataset(phrases, num_phrases);
+    } 
+    else if (strcmp(argv[1], "gen") == 0) {
+        // --- INFERENCE MODE ---
+        if (argc < 3) { 
+            printf("Error: Provide a prompt.\nExample: ./c2 gen \"Long Live\"\n"); 
+            return 1; 
+        }
+        
+        printf("[IO] Loading model_final.bin...\n");
+        load_checkpoint("model_final.bin", model->params, model->n_params);
+        
+        char* prompt = argv[2];
+        int prompt_len = strlen(prompt);
+        int* ctx = calloc(SEQ_LEN, sizeof(int));
+        
+        // Tokenize Prompt (Byte-level copy)
+        printf("\nGenerating: %s", prompt);
+        for(int i=0; i<prompt_len && i<SEQ_LEN; i++) ctx[i] = (unsigned char)prompt[i];
+        
+        // Generation Loop
+        int head = prompt_len;
+        while(head < SEQ_LEN) {
+            arena_reset(&acts.arena);
+            
+            // 1. Run Model
+            int batch_input[BATCH_SIZE * SEQ_LEN];
+            memset(batch_input, 0, sizeof(batch_input));
+            memcpy(batch_input, ctx, SEQ_LEN * sizeof(int));
+            
+            forward_pass(model, &acts, batch_input);
+            
+            // 2. Get Logits for the last token (head-1)
+            float* logits = acts.logits.data + (0 * SEQ_LEN * VOCAB_SIZE) + ((head-1) * VOCAB_SIZE);
+            
+            // 3. Sample
+            int next_token = sample_temp(logits, VOCAB_SIZE, 0.7f); // Temp 0.7
+            
+            // 4. Print & Advance
+            printf("%c", (unsigned char)next_token);
+            fflush(stdout);
+            
+            ctx[head] = next_token;
+            head++;
+        }
+        printf("\n\n[Done]\n");
+        free(ctx);
+    }
+    else {
+        printf("Unknown command. Use 'train' or 'gen'.\n");
+        return 1;
+    }
     
     return 0;
 }
