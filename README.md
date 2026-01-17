@@ -18,7 +18,7 @@ Phonex-C2 is a fully functional transformer language model written entirely in C
 
 ---
 
-## ✨ Key Features
+## Key Features
 
 | Feature | Description |
 |---------|-------------|
@@ -33,7 +33,7 @@ Phonex-C2 is a fully functional transformer language model written entirely in C
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 Phonex-C2 implements a 4-layer transformer decoder:
 
