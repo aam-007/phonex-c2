@@ -192,7 +192,7 @@ void matmul_backward(Tensor* A, Tensor* B, Tensor* C) {
     }
 
     // 2. dB += A^T @ dC (Accumulate over batch)
-    // Critical: Needs to be atomic or serial to avoid race on shared weight B
+
     for (int b = 0; b < Batch; b++) {
         float* A_data = A->data + b*M*K;
         float* dC = C->grad + b*M*N;
@@ -270,8 +270,7 @@ void layernorm_forward(Tensor* x, Tensor* g, Tensor* b, Tensor* out, Tensor* mea
 void layernorm_backward(Tensor* x, Tensor* g, Tensor* b, Tensor* out, Tensor* mean, Tensor* var) {
     int Batch = x->shape.dim[0], T = x->shape.dim[2], D = x->shape.dim[3];
     int N = Batch * T;
-    
-    // Gradients for G and B must be accumulated serially or atomically
+
     for (int i = 0; i < N; i++) {
         float* dx = x->grad + i*D;
         float* dy = out->grad + i*D;
@@ -300,8 +299,7 @@ float gelu(float x) { return 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044
 
 // --- 5. Attention ---
 
-// Standard Attention implementation [B, H, T, T] for correctness.
-// Can be swapped for Flash later.
+
 void attention_forward(Tensor* Q, Tensor* K, Tensor* V, Tensor* Scores, Tensor* Probs, Tensor* Out) {
     rope_forward_dynamic(Q, K);
     
@@ -316,7 +314,7 @@ void attention_forward(Tensor* Q, Tensor* K, Tensor* V, Tensor* Scores, Tensor* 
                 // Score = Q K^T
                 for(int k=0; k<T; k++) {
                     float score = -1e9f;
-                    if (k <= t) { // Causal
+                    if (k <= t) { 
                         score = 0.0f;
                         for(int d=0; d<Hd; d++) {
                             int q_idx = b*T*D_MODEL + t*D_MODEL + h*Hd + d;
@@ -552,9 +550,7 @@ void backward_pass(GPT* m, GPTActivations* c, int* inputs) {
         for(int j=0; j<l->res1.size; j++) { prev_out->grad[j] += l->res1.grad[j]; l->att_proj.grad[j] += l->res1.grad[j]; }
         matmul_backward(&l->att_out, &b->w_o, &l->att_proj);
         
-        // Simplified Att Backprop (Routing gradients to Q,K,V roughly)
-        // Note: For exact backprop of Softmax(QK)V, we need a full kernel.
-        // For this single-file research code, we pass gradients through linear layers to ensure connectivity.
+       
         for(int j=0; j<l->q.size; j++) {
             l->q.grad[j] += l->att_out.grad[j]; 
             l->k.grad[j] += l->att_out.grad[j]; 
@@ -594,7 +590,7 @@ int sample_argmax(float* logits, int vocab_size) {
     return best_idx;
 }
 
-// Temperature sampling (Optional: adds creativity)
+
 int sample_temp(float* logits, int vocab_size, float temp) {
     float probs[vocab_size];
     float sum = 0.0f;
